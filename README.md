@@ -9,7 +9,7 @@ Claude Code's subscription auth (`claude auth login`) requires a browser OAuth c
 ## Quick Install
 
 ```bash
-git clone https://github.com/youruser/cc-auth-bridge.git
+git clone https://github.com/zudsniper/cc-auth-bridge.git
 cd cc-auth-bridge
 ./install.sh
 ```
@@ -67,9 +67,29 @@ cc-auth-bridge provide [flags]
 brew install localsend
 ```
 
-### Linux (Debian/Ubuntu)
+### Linux x86_64 (Debian/Ubuntu)
 
 Download the latest `.deb` from the [LocalSend releases](https://github.com/localsend/localsend/releases) page, or let `cc-auth-bridge` attempt automatic installation when it detects LocalSend is missing.
+
+### Raspberry Pi / ARM Linux (headless)
+
+The official LocalSend app requires a GUI (GTK/Flutter), which isn't practical on a headless Pi. `cc-auth-bridge` automatically detects ARM architecture and headless environments and installs [localsend-go](https://github.com/meowrain/localsend-go) instead — a lightweight Go implementation of the LocalSend protocol that works without a display.
+
+This happens automatically when you run `cc-auth-bridge` and no LocalSend CLI is found. You can also install it manually:
+
+```bash
+# Download the latest ARM64 binary
+curl -fsSL -o localsend-go \
+  "$(curl -s https://api.github.com/repos/meowrain/localsend-go/releases/latest \
+    | jq -r '.assets[] | select(.name | test("linux-arm64")) | .browser_download_url' | head -1)"
+chmod +x localsend-go
+mv localsend-go ~/.local/bin/
+
+# Optional: enable device discovery
+sudo setcap cap_net_raw=+ep ~/.local/bin/localsend-go
+```
+
+**Note:** `localsend-go` uses interactive device discovery when sending (no `--target` flag). For the typical use case — Pi as the receiver — this doesn't matter since receive mode auto-accepts all transfers.
 
 ### Other Linux
 
@@ -95,6 +115,9 @@ Ensure both machines are on the same LAN and no firewall is blocking the port (d
 
 **Token format not recognized**
 The tool expects tokens matching `sk-ant-oat01-*`. If the format has changed, the token is still transferred but a warning is shown.
+
+**Raspberry Pi / ARM: "localsend-go" device discovery not working**
+Run `sudo setcap cap_net_raw=+ep ~/.local/bin/localsend-go` to grant network discovery capabilities. Direct IP-based send/receive still works without this.
 
 ## Security Notes
 

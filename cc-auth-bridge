@@ -56,6 +56,17 @@ detect_os() {
     esac
 }
 
+detect_arch() {
+    local machine
+    machine=$(uname -m)
+    case "$machine" in
+        x86_64|amd64)       echo "amd64" ;;
+        aarch64|arm64)      echo "arm64" ;;
+        armv7l|armhf)       echo "armv7" ;;
+        *)                  echo "$machine" ;;
+    esac
+}
+
 get_local_ip() {
     local os
     os=$(detect_os)
@@ -87,13 +98,30 @@ get_local_ip() {
 LOCALSEND_BIN=""
 
 find_localsend_cli() {
-    for candidate in localsend_app localsend-cli localsend; do
+    # Check PATH candidates (official + localsend-go)
+    for candidate in localsend_app localsend-cli localsend localsend-go; do
         if command -v "$candidate" &>/dev/null; then
             LOCALSEND_BIN="$candidate"
             return 0
         fi
     done
+    # Check common manual install location
+    if [[ -x "$HOME/.local/bin/localsend-go" ]]; then
+        LOCALSEND_BIN="$HOME/.local/bin/localsend-go"
+        return 0
+    fi
     return 1
+}
+
+# Returns "localsend-go" if we installed/found the Go CLI, empty otherwise
+LOCALSEND_VARIANT=""
+
+detect_localsend_variant() {
+    if [[ "$LOCALSEND_BIN" == *localsend-go* ]]; then
+        LOCALSEND_VARIANT="localsend-go"
+    else
+        LOCALSEND_VARIANT="official"
+    fi
 }
 
 check_dependencies() {
@@ -119,11 +147,17 @@ check_dependencies() {
 
     if ! find_localsend_cli; then
         log_error "LocalSend CLI not found in PATH"
-        echo "  Looked for: localsend_app, localsend-cli, localsend"
+        echo "  Looked for: localsend_app, localsend-cli, localsend, localsend-go"
         if [[ "$os" == "darwin" ]]; then
             echo "  Install: brew install localsend"
         else
-            echo "  Install: see https://github.com/localsend/localsend#install"
+            local arch
+            arch=$(detect_arch)
+            if [[ "$arch" == "arm64" || "$arch" == "armv7" ]]; then
+                echo "  ARM detected — will install localsend-go (headless-friendly Go CLI)"
+            else
+                echo "  Install: see https://github.com/localsend/localsend#install"
+            fi
         fi
         echo ""
         read -rp "Attempt automatic install? [y/N] " answer
@@ -131,6 +165,11 @@ check_dependencies() {
             install_localsend
         else
             missing=1
+        fi
+    else
+        detect_localsend_variant
+        if [[ "$LOCALSEND_VARIANT" == "localsend-go" ]]; then
+            log_info "Using localsend-go CLI: $LOCALSEND_BIN"
         fi
     fi
 
@@ -141,8 +180,10 @@ check_dependencies() {
 }
 
 install_localsend() {
-    local os
+    local os arch
     os=$(detect_os)
+    arch=$(detect_arch)
+
     if [[ "$os" == "darwin" ]]; then
         log_info "Installing LocalSend via Homebrew..."
         if ! command -v brew &>/dev/null; then
@@ -150,27 +191,22 @@ install_localsend() {
             exit 1
         fi
         brew install localsend
-    else
-        log_info "Installing LocalSend on Linux..."
-        if command -v apt-get &>/dev/null; then
-            # Fetch latest .deb from GitHub releases
-            local release_url latest_tag deb_url tmpf
-            release_url="https://api.github.com/repos/localsend/localsend/releases/latest"
-            latest_tag=$(curl -fsSL "$release_url" | jq -r '.tag_name')
-            if [[ -z "$latest_tag" || "$latest_tag" == "null" ]]; then
-                log_error "Could not fetch latest LocalSend release"
-                exit 1
-            fi
-            local ver="${latest_tag#v}"
-            deb_url="https://github.com/localsend/localsend/releases/download/${latest_tag}/LocalSend-${ver}-linux-x86-64.deb"
-            tmpf=$(mktmpfile)
-            log_info "Downloading $deb_url ..."
-            curl -fsSL -o "$tmpf" "$deb_url"
-            sudo dpkg -i "$tmpf" || sudo apt-get install -f -y
+    elif [[ "$os" == "linux" ]]; then
+        # Decide strategy: ARM or headless → localsend-go, x86_64 with desktop → official .deb
+        local use_go=false
+
+        if [[ "$arch" == "arm64" || "$arch" == "armv7" ]]; then
+            use_go=true
+            log_info "ARM architecture detected ($arch) — using localsend-go"
+        elif [[ -z "${DISPLAY:-}" && -z "${WAYLAND_DISPLAY:-}" ]]; then
+            use_go=true
+            log_info "Headless environment detected — using localsend-go (no GUI needed)"
+        fi
+
+        if [[ "$use_go" == true ]]; then
+            install_localsend_go
         else
-            log_error "Unsupported Linux package manager. Install LocalSend manually."
-            log_error "See: https://github.com/localsend/localsend#install"
-            exit 1
+            install_localsend_official_deb
         fi
     fi
 
@@ -179,7 +215,152 @@ install_localsend() {
         log_error "You may need to add it to your PATH or restart your shell."
         exit 1
     fi
+    detect_localsend_variant
     log_success "LocalSend CLI found: $LOCALSEND_BIN"
+}
+
+install_localsend_go() {
+    local arch
+    arch=$(detect_arch)
+
+    # Map to localsend-go release naming
+    local go_arch=""
+    case "$arch" in
+        amd64)  go_arch="amd64" ;;
+        arm64)  go_arch="arm64" ;;
+        armv7)  go_arch="arm" ;;
+        *)      log_error "Unsupported architecture for localsend-go: $arch"; exit 1 ;;
+    esac
+
+    log_info "Fetching latest localsend-go release..."
+    local release_url="https://api.github.com/repos/meowrain/localsend-go/releases/latest"
+    local release_json
+    release_json=$(curl -fsSL "$release_url" 2>/dev/null)
+
+    if [[ -z "$release_json" ]]; then
+        log_error "Could not fetch localsend-go releases from GitHub"
+        log_error "Install manually: https://github.com/meowrain/localsend-go/releases"
+        exit 1
+    fi
+
+    # Find the linux-arm64 or linux-amd64 binary asset
+    local download_url
+    download_url=$(echo "$release_json" | jq -r \
+        --arg pattern "linux-${go_arch}" \
+        '[.assets[] | select(.name | test($pattern; "i")) | select(.name | test("\\.(tar\\.gz|zip)$") | not)] | .[0].browser_download_url // empty')
+
+    # Fallback: try tar.gz if no bare binary
+    if [[ -z "$download_url" ]]; then
+        download_url=$(echo "$release_json" | jq -r \
+            --arg pattern "linux-${go_arch}" \
+            '[.assets[] | select(.name | test($pattern; "i"))] | .[0].browser_download_url // empty')
+    fi
+
+    if [[ -z "$download_url" ]]; then
+        log_error "Could not find localsend-go binary for linux-${go_arch}"
+        log_error "Available assets:"
+        echo "$release_json" | jq -r '.assets[].name' >&2
+        log_error "Install manually: https://github.com/meowrain/localsend-go/releases"
+        exit 1
+    fi
+
+    local filename
+    filename=$(basename "$download_url")
+    log_info "Downloading $filename ..."
+
+    local install_dir="$HOME/.local/bin"
+    mkdir -p "$install_dir"
+
+    local tmpf
+    tmpf=$(mktmpfile)
+    curl -fsSL -o "$tmpf" "$download_url"
+
+    if [[ "$filename" == *.tar.gz ]]; then
+        local tmpdir
+        tmpdir=$(mktemp -d "${TMPDIR:-/tmp}/localsend-go-extract.XXXXXX")
+        TMPFILES+=("$tmpdir")
+        tar -xzf "$tmpf" -C "$tmpdir"
+        # Find the binary inside
+        local bin_found=""
+        for f in "$tmpdir"/localsend-go* "$tmpdir"/*/localsend-go*; do
+            if [[ -f "$f" && ! "$f" == *.tar.gz ]]; then
+                bin_found="$f"
+                break
+            fi
+        done
+        if [[ -z "$bin_found" ]]; then
+            log_error "Could not find localsend-go binary in archive"
+            ls -la "$tmpdir" >&2
+            exit 1
+        fi
+        cp "$bin_found" "$install_dir/localsend-go"
+    elif [[ "$filename" == *.zip ]]; then
+        local tmpdir
+        tmpdir=$(mktemp -d "${TMPDIR:-/tmp}/localsend-go-extract.XXXXXX")
+        TMPFILES+=("$tmpdir")
+        unzip -q "$tmpf" -d "$tmpdir"
+        local bin_found=""
+        for f in "$tmpdir"/localsend-go* "$tmpdir"/*/localsend-go*; do
+            if [[ -f "$f" && ! "$f" == *.zip ]]; then
+                bin_found="$f"
+                break
+            fi
+        done
+        if [[ -z "$bin_found" ]]; then
+            log_error "Could not find localsend-go binary in archive"
+            exit 1
+        fi
+        cp "$bin_found" "$install_dir/localsend-go"
+    else
+        # Bare binary
+        cp "$tmpf" "$install_dir/localsend-go"
+    fi
+
+    chmod +x "$install_dir/localsend-go"
+    log_success "Installed localsend-go to $install_dir/localsend-go"
+
+    # Ensure ~/.local/bin is in PATH for this session
+    if ! echo "$PATH" | tr ':' '\n' | grep -qx "$install_dir"; then
+        export PATH="$install_dir:$PATH"
+        log_warn "$install_dir is not in your PATH. Added for this session."
+        log_warn "Add permanently: export PATH=\"$install_dir:\$PATH\" in your shell rc"
+    fi
+
+    # Set network capabilities for device discovery (optional, non-fatal)
+    if command -v setcap &>/dev/null; then
+        log_info "Setting network capabilities for device discovery..."
+        sudo setcap cap_net_raw=+ep "$install_dir/localsend-go" 2>/dev/null || \
+            log_warn "Could not set cap_net_raw (device discovery may not work, but direct IP send/receive will)"
+    fi
+}
+
+install_localsend_official_deb() {
+    log_info "Installing official LocalSend .deb..."
+    if ! command -v apt-get &>/dev/null; then
+        log_error "apt-get not found. Cannot install .deb package."
+        log_info "Falling back to localsend-go..."
+        install_localsend_go
+        return
+    fi
+
+    local release_url latest_tag deb_url tmpf
+    release_url="https://api.github.com/repos/localsend/localsend/releases/latest"
+    latest_tag=$(curl -fsSL "$release_url" | jq -r '.tag_name')
+    if [[ -z "$latest_tag" || "$latest_tag" == "null" ]]; then
+        log_error "Could not fetch latest LocalSend release. Falling back to localsend-go..."
+        install_localsend_go
+        return
+    fi
+    local ver="${latest_tag#v}"
+    deb_url="https://github.com/localsend/localsend/releases/download/${latest_tag}/LocalSend-${ver}-linux-x86-64.deb"
+    tmpf=$(mktmpfile)
+    log_info "Downloading $deb_url ..."
+    if ! curl -fsSL -o "$tmpf" "$deb_url"; then
+        log_error "Download failed. Falling back to localsend-go..."
+        install_localsend_go
+        return
+    fi
+    sudo dpkg -i "$tmpf" || sudo apt-get install -f -y
 }
 
 extract_token() {
@@ -323,6 +504,53 @@ warn_api_key() {
     fi
 }
 
+# --- LocalSend variant abstraction ---
+# localsend-go has different CLI syntax than the official app:
+#   receive: no --destination flag, saves to ./uploads/ relative to cwd
+#   send:    no --target flag, uses interactive device picker
+#   --port must come BEFORE the subcommand
+
+do_localsend_receive() {
+    local port="$1"
+    local recv_dir="$2"
+
+    if [[ "$LOCALSEND_VARIANT" == "localsend-go" ]]; then
+        # localsend-go saves to ./uploads/ relative to cwd, no dest flag
+        # We cd to recv_dir so uploads/ lands inside it
+        log_info "Using localsend-go receive (auto-accept enabled)..."
+        (cd "$recv_dir" && "$LOCALSEND_BIN" --port="$port" receive)
+        # Move files from uploads/ subdirectory up
+        if [[ -d "$recv_dir/uploads" ]]; then
+            mv "$recv_dir/uploads"/* "$recv_dir/" 2>/dev/null || true
+            rmdir "$recv_dir/uploads" 2>/dev/null || true
+        fi
+    else
+        "$LOCALSEND_BIN" receive --port "$port" --destination "$recv_dir"
+    fi
+}
+
+do_localsend_send() {
+    local port="$1"
+    local target="$2"
+    local file="$3"
+
+    if [[ "$LOCALSEND_VARIANT" == "localsend-go" ]]; then
+        # localsend-go has no --target flag; it uses interactive device discovery
+        if [[ -n "$target" ]]; then
+            log_warn "localsend-go does not support --target. It will discover devices on the LAN."
+            log_warn "Look for the target device (IP: $target) in the device list and select it."
+        fi
+        if [[ "$port" != "$DEFAULT_PORT" ]]; then
+            log_warn "localsend-go hardcodes remote port $DEFAULT_PORT when sending."
+            log_warn "Your --port $port will only affect the local listening port."
+        fi
+        echo ""
+        "$LOCALSEND_BIN" --port="$port" send "$file"
+    else
+        "$LOCALSEND_BIN" send --port "$port" --destination "$target" --file "$file"
+    fi
+}
+
 # --- Subcommands ---
 
 cmd_listen() {
@@ -359,7 +587,7 @@ cmd_listen() {
     TMPFILES+=("$recv_dir")
 
     log_info "Waiting for token transfer via LocalSend..."
-    if ! "$LOCALSEND_BIN" receive --port "$port" --destination "$recv_dir" 2>&1; then
+    if ! do_localsend_receive "$port" "$recv_dir"; then
         log_error "LocalSend receive failed"
         exit 1
     fi
@@ -513,8 +741,8 @@ cmd_provide() {
     mv "$tmpf" "$json_tmpf"
     TMPFILES+=("$json_tmpf")
 
-    # Get target IP
-    if [[ -z "$target" ]]; then
+    # Get target IP (not needed for localsend-go which uses discovery, but still useful for messaging)
+    if [[ -z "$target" ]] && [[ "$LOCALSEND_VARIANT" != "localsend-go" ]]; then
         echo ""
         read -rp "Enter the target machine's IP address: " target
         if [[ -z "$target" ]]; then
@@ -524,9 +752,13 @@ cmd_provide() {
     fi
 
     echo ""
-    log_info "Sending token to ${BOLD}${target}:${port}${RESET} via LocalSend..."
+    if [[ -n "$target" ]]; then
+        log_info "Sending token to ${BOLD}${target}:${port}${RESET} via LocalSend..."
+    else
+        log_info "Sending token via LocalSend (device discovery)..."
+    fi
 
-    if "$LOCALSEND_BIN" send --port "$port" --destination "$target" --file "$json_tmpf" 2>&1; then
+    if do_localsend_send "$port" "$target" "$json_tmpf"; then
         echo ""
         log_success "Token sent successfully!"
         log_info "On the target machine, the token should now be received and applied."

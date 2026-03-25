@@ -333,23 +333,14 @@ check_dependencies() {
     fi
 
     if ! find_localsend_cli; then
-        log_error "LocalSend CLI not found in PATH"
+        log_warn "LocalSend CLI not found in PATH"
         echo "  Looked for: localsend_app, localsend-cli, localsend, localsend-go"
-        if [[ "$os" == "darwin" ]]; then
-            echo "  Install: brew install localsend"
-        else
-            local arch
-            arch=$(detect_arch)
-            if [[ "$arch" == "arm64" || "$arch" == "armv7" ]]; then
-                echo "  ARM detected — will install localsend-go (headless-friendly Go CLI)"
-            else
-                echo "  Install: see https://github.com/localsend/localsend#install"
-            fi
-        fi
+        echo "  Will install localsend-go (lightweight Go CLI, works everywhere)"
         echo ""
-        read -rp "Attempt automatic install? [y/N] " answer
-        if [[ "${answer,,}" == "y" ]]; then
-            install_localsend
+        read -rp "Install localsend-go? [Y/n] " answer
+        if [[ "${answer,,}" != "n" ]]; then
+            install_localsend_go
+            find_localsend_cli || missing=1
         else
             missing=1
         fi
@@ -366,49 +357,10 @@ check_dependencies() {
     fi
 }
 
-install_localsend() {
-    local os arch
-    os=$(detect_os)
-    arch=$(detect_arch)
-
-    if [[ "$os" == "darwin" ]]; then
-        log_info "Installing LocalSend via Homebrew..."
-        if ! command -v brew &>/dev/null; then
-            log_error "Homebrew not found. Install LocalSend manually."
-            exit 1
-        fi
-        brew install localsend
-    elif [[ "$os" == "linux" ]]; then
-        # Decide strategy: ARM or headless → localsend-go, x86_64 with desktop → official .deb
-        local use_go=false
-
-        if [[ "$arch" == "arm64" || "$arch" == "armv7" ]]; then
-            use_go=true
-            log_info "ARM architecture detected ($arch) — using localsend-go"
-        elif [[ -z "${DISPLAY:-}" && -z "${WAYLAND_DISPLAY:-}" ]]; then
-            use_go=true
-            log_info "Headless environment detected — using localsend-go (no GUI needed)"
-        fi
-
-        if [[ "$use_go" == true ]]; then
-            install_localsend_go
-        else
-            install_localsend_official_deb
-        fi
-    fi
-
-    if ! find_localsend_cli; then
-        log_error "LocalSend installed but CLI binary not found in PATH."
-        log_error "You may need to add it to your PATH or restart your shell."
-        exit 1
-    fi
-    detect_localsend_variant
-    log_success "LocalSend CLI found: $LOCALSEND_BIN"
-}
-
 install_localsend_go() {
-    local arch
+    local arch os_name
     arch=$(detect_arch)
+    os_name=$(detect_os)  # "darwin" or "linux"
 
     # Map to localsend-go release naming
     local go_arch=""
@@ -419,7 +371,8 @@ install_localsend_go() {
         *)      log_error "Unsupported architecture for localsend-go: $arch"; exit 1 ;;
     esac
 
-    log_info "Fetching latest localsend-go release..."
+    local asset_pattern="${os_name}-${go_arch}"
+    log_info "Fetching latest localsend-go release for ${asset_pattern}..."
     local release_url="https://api.github.com/repos/meowrain/localsend-go/releases/latest"
     local release_json
     release_json=$(curl -fsSL "$release_url" 2>/dev/null)
@@ -430,21 +383,21 @@ install_localsend_go() {
         exit 1
     fi
 
-    # Find the linux-arm64 or linux-amd64 binary asset
+    # Find the bare binary asset (no .tar.gz/.zip extension)
     local download_url
     download_url=$(echo "$release_json" | jq -r \
-        --arg pattern "linux-${go_arch}" \
-        '[.assets[] | select(.name | test($pattern; "i")) | select(.name | test("\\.(tar\\.gz|zip)$") | not)] | .[0].browser_download_url // empty')
+        --arg pattern "$asset_pattern" \
+        '[.assets[] | select(.name | test($pattern; "i")) | select(.name | test("\\.(tar\\.gz|zip|exe)$") | not)] | .[0].browser_download_url // empty')
 
-    # Fallback: try tar.gz if no bare binary
+    # Fallback: try tar.gz/zip if no bare binary
     if [[ -z "$download_url" ]]; then
         download_url=$(echo "$release_json" | jq -r \
-            --arg pattern "linux-${go_arch}" \
+            --arg pattern "$asset_pattern" \
             '[.assets[] | select(.name | test($pattern; "i"))] | .[0].browser_download_url // empty')
     fi
 
     if [[ -z "$download_url" ]]; then
-        log_error "Could not find localsend-go binary for linux-${go_arch}"
+        log_error "Could not find localsend-go binary for ${asset_pattern}"
         log_error "Available assets:"
         echo "$release_json" | jq -r '.assets[].name' >&2
         log_error "Install manually: https://github.com/meowrain/localsend-go/releases"
@@ -521,34 +474,7 @@ install_localsend_go() {
     fi
 }
 
-install_localsend_official_deb() {
-    log_info "Installing official LocalSend .deb..."
-    if ! command -v apt-get &>/dev/null; then
-        log_error "apt-get not found. Cannot install .deb package."
-        log_info "Falling back to localsend-go..."
-        install_localsend_go
-        return
-    fi
 
-    local release_url latest_tag deb_url tmpf
-    release_url="https://api.github.com/repos/localsend/localsend/releases/latest"
-    latest_tag=$(curl -fsSL "$release_url" | jq -r '.tag_name')
-    if [[ -z "$latest_tag" || "$latest_tag" == "null" ]]; then
-        log_error "Could not fetch latest LocalSend release. Falling back to localsend-go..."
-        install_localsend_go
-        return
-    fi
-    local ver="${latest_tag#v}"
-    deb_url="https://github.com/localsend/localsend/releases/download/${latest_tag}/LocalSend-${ver}-linux-x86-64.deb"
-    tmpf=$(mktmpfile)
-    log_info "Downloading $deb_url ..."
-    if ! curl -fsSL -o "$tmpf" "$deb_url"; then
-        log_error "Download failed. Falling back to localsend-go..."
-        install_localsend_go
-        return
-    fi
-    sudo dpkg -i "$tmpf" || sudo apt-get install -f -y
-}
 
 extract_token() {
     if [[ ! -f "$CREDS_FILE" ]]; then

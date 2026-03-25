@@ -736,6 +736,100 @@ do_localsend_send() {
 
 # --- Subcommands ---
 
+wait_for_provider() {
+    local port="$1"
+    local recv_dir="$2"
+    local timeout=30
+    local frames=(
+        "📡  Waiting for provider...   🔍"
+        "📡  Waiting for provider ..   🔎"
+        "📡  Waiting for provider  .   🔍"
+        "📡  Waiting for provider   .  🔎"
+        "📡  Waiting for provider  .   🔍"
+        "📡  Waiting for provider ..   🔎"
+        "📡  Waiting for provider...   🔍"
+        "📡  Waiting for provider.... 🛸"
+    )
+    local nframes=${#frames[@]}
+    local frame_idx=0
+    local ticks=0            # each tick ≈ 0.4s
+    local ticks_per_sec=3    # ~2.5 ticks/sec, close enough
+    local timeout_ticks=$(( timeout * ticks_per_sec ))
+
+    # Start the receive process in the background
+    do_localsend_receive "$port" "$recv_dir" &
+    local recv_pid=$!
+
+    local got_file=false
+
+    # Hide cursor, restore on return
+    printf '\033[?25l'
+    trap 'printf "\033[?25h\r\033[K"' RETURN
+
+    while true; do
+        # Check if receive process finished
+        if ! kill -0 "$recv_pid" 2>/dev/null; then
+            wait "$recv_pid" 2>/dev/null
+            got_file=true
+            break
+        fi
+
+        # Check if any json file arrived (some backends stay running)
+        for f in "$recv_dir"/*.json "$recv_dir"/uploads/*.json; do
+            if [[ -f "$f" ]]; then
+                got_file=true
+                break 2
+            fi
+        done
+
+        # Animate
+        local secs_left=$(( (timeout_ticks - ticks) / ticks_per_sec ))
+        (( secs_left < 0 )) && secs_left=0
+        printf '\r\033[K  %s  ⏱️  %ds ' "${frames[$frame_idx]}" "$secs_left"
+        frame_idx=$(( (frame_idx + 1) % nframes ))
+        ticks=$(( ticks + 1 ))
+
+        sleep 0.4
+
+        # Timeout → ask user
+        if (( ticks >= timeout_ticks )); then
+            printf '\r\033[K'
+            printf '\033[?25h'   # show cursor for prompt
+            echo ""
+            log_warn "⏰ No provider found after ${timeout}s."
+            echo ""
+            read -rp "  Keep waiting? [Y/n] " answer
+            if [[ "${answer,,}" == "n" ]]; then
+                kill "$recv_pid" 2>/dev/null || true
+                wait "$recv_pid" 2>/dev/null || true
+                log_error "Cancelled."
+                exit 1
+            fi
+            # Reset timer, hide cursor again
+            ticks=0
+            printf '\033[?25l'
+            echo ""
+        fi
+    done
+
+    printf '\r\033[K'
+    printf '\033[?25h'
+    echo ""
+
+    # Clean up background process if still running
+    if kill -0 "$recv_pid" 2>/dev/null; then
+        kill "$recv_pid" 2>/dev/null || true
+        wait "$recv_pid" 2>/dev/null || true
+    fi
+
+    if [[ "$got_file" == true ]]; then
+        log_success "📦 Transfer received!"
+    else
+        log_error "Receive process ended without a file."
+        exit 1
+    fi
+}
+
 cmd_listen() {
     local port="$DEFAULT_PORT"
     local no_verify=false
@@ -767,16 +861,12 @@ cmd_listen() {
     echo "    ${BOLD}cc-auth-bridge provide --target $ip${RESET}"
     echo ""
 
-    # Receive file via LocalSend
+    # Receive file via LocalSend with animated waiting
     local recv_dir
     recv_dir=$(mktemp -d "${TMPDIR:-/tmp}/cc-auth-recv.XXXXXX")
     TMPFILES+=("$recv_dir")
 
-    log_info "Waiting for token transfer via LocalSend..."
-    if ! do_localsend_receive "$port" "$recv_dir"; then
-        log_error "LocalSend receive failed"
-        exit 1
-    fi
+    wait_for_provider "$port" "$recv_dir"
 
     # Find the received JSON file
     local json_file=""

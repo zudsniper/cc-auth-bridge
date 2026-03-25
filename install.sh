@@ -38,12 +38,21 @@ fi
 
 echo "Installed to $DEST"
 
-# Check PATH
-if ! echo "$PATH" | tr ':' '\n' | grep -qx "$DEST_DIR"; then
-    echo ""
-    echo "Warning: $DEST_DIR is not in your PATH."
-    echo "Add it with:"
-    echo "  export PATH=\"$DEST_DIR:\$PATH\""
+# Ensure ~/.local/bin is in PATH via .bashrc (covers non-login shells like ssh commands)
+if [[ "$DEST_DIR" == "$HOME/.local/bin" ]]; then
+    BASHRC="$HOME/.bashrc"
+    PATH_LINE='export PATH="$HOME/.local/bin:$PATH"'
+    if [[ -f "$BASHRC" ]] && ! grep -qF '.local/bin' "$BASHRC" 2>/dev/null; then
+        echo "" >> "$BASHRC"
+        echo '# Added by cc-auth-bridge installer' >> "$BASHRC"
+        echo "$PATH_LINE" >> "$BASHRC"
+        echo "Added $DEST_DIR to PATH in $BASHRC"
+    fi
+    # Also ensure current session has it
+    if ! echo "$PATH" | tr ':' '\n' | grep -qx "$DEST_DIR"; then
+        export PATH="$DEST_DIR:$PATH"
+        echo "Added $DEST_DIR to PATH for this session"
+    fi
 fi
 
 echo "Done. Run 'cc-auth-bridge --help' to get started."

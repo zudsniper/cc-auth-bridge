@@ -241,25 +241,95 @@ detect_localsend_variant() {
     fi
 }
 
+install_node() {
+    local os
+    os=$(detect_os)
+    log_info "Node.js not found. Installing..."
+
+    if [[ "$os" == "darwin" ]]; then
+        if command -v brew &>/dev/null; then
+            brew install node
+        else
+            log_error "Homebrew not found. Install Node.js manually: https://nodejs.org"
+            return 1
+        fi
+    else
+        # Use NodeSource for up-to-date Node on Debian/Ubuntu/Raspbian
+        if command -v apt-get &>/dev/null; then
+            log_info "Installing Node.js via NodeSource (LTS)..."
+            curl -fsSL https://deb.nodesource.com/setup_lts.x | sudo -E bash -
+            sudo apt-get install -y nodejs
+        else
+            log_error "Unsupported package manager. Install Node.js manually: https://nodejs.org"
+            return 1
+        fi
+    fi
+
+    if ! command -v node &>/dev/null; then
+        log_error "Node.js installation failed."
+        return 1
+    fi
+    log_success "Node.js installed: $(node --version)"
+}
+
+install_claude_cli() {
+    log_info "Installing Claude Code CLI..."
+    if ! command -v npm &>/dev/null; then
+        log_error "npm not found even after Node.js install."
+        return 1
+    fi
+    sudo npm install -g @anthropic-ai/claude-code
+    if ! command -v claude &>/dev/null; then
+        log_error "Claude Code CLI installation failed."
+        return 1
+    fi
+    log_success "Claude Code CLI installed: $(claude --version 2>/dev/null || echo 'ok')"
+}
+
 check_dependencies() {
     local missing=0
     local os
     os=$(detect_os)
 
+    # Node.js → needed for Claude CLI
+    if ! command -v node &>/dev/null; then
+        log_warn "Node.js not found (required for Claude Code CLI)"
+        read -rp "Install Node.js? [Y/n] " answer
+        if [[ "${answer,,}" != "n" ]]; then
+            install_node || missing=1
+        else
+            missing=1
+        fi
+    fi
+
+    # Claude Code CLI
     if ! command -v claude &>/dev/null; then
-        log_error "'claude' CLI not found in PATH"
-        echo "  Install: npm install -g @anthropic-ai/claude-code"
-        missing=1
+        log_warn "Claude Code CLI not found"
+        read -rp "Install Claude Code CLI via npm? [Y/n] " answer
+        if [[ "${answer,,}" != "n" ]]; then
+            install_claude_cli || missing=1
+        else
+            missing=1
+        fi
     fi
 
     if ! command -v jq &>/dev/null; then
-        log_error "'jq' not found in PATH"
+        log_warn "'jq' not found"
         if [[ "$os" == "darwin" ]]; then
-            echo "  Install: brew install jq"
+            read -rp "Install jq via Homebrew? [Y/n] " answer
+            if [[ "${answer,,}" != "n" ]]; then
+                brew install jq || missing=1
+            else
+                missing=1
+            fi
         else
-            echo "  Install: sudo apt-get install jq"
+            read -rp "Install jq via apt? [Y/n] " answer
+            if [[ "${answer,,}" != "n" ]]; then
+                sudo apt-get install -y jq || missing=1
+            else
+                missing=1
+            fi
         fi
-        missing=1
     fi
 
     if ! find_localsend_cli; then

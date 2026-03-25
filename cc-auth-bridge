@@ -95,6 +95,123 @@ get_local_ip() {
     fi
 }
 
+discover_devices() {
+    local port="$1"
+    local my_ip
+    my_ip=$(get_local_ip)
+
+    if [[ "$my_ip" == "unknown" ]]; then
+        log_error "Cannot discover devices: local IP unknown"
+        return 1
+    fi
+
+    # Derive /24 subnet base
+    local subnet_base
+    subnet_base=$(echo "$my_ip" | sed 's/\.[0-9]*$//')
+
+    log_info "Scanning ${subnet_base}.0/24 for LocalSend listeners on port ${port}..."
+
+    local tmpdir
+    tmpdir=$(mktemp -d "${TMPDIR:-/tmp}/cc-auth-scan.XXXXXX")
+    TMPFILES+=("$tmpdir")
+
+    # Parallel scan: hit the LocalSend v2 info endpoint on each IP
+    # Use HTTPS with --insecure since LocalSend uses self-signed certs
+    local pids=()
+    for i in $(seq 1 254); do
+        local ip="${subnet_base}.${i}"
+        # Skip our own IP
+        [[ "$ip" == "$my_ip" ]] && continue
+        (
+            local resp
+            resp=$(curl -skf --connect-timeout 1 --max-time 2 \
+                "https://${ip}:${port}/api/localsend/v2/info" 2>/dev/null) || exit 1
+            # Validate it looks like a LocalSend response
+            if echo "$resp" | jq -e '.alias' &>/dev/null 2>&1; then
+                local alias
+                alias=$(echo "$resp" | jq -r '.alias // "unknown"')
+                echo "${ip}|${alias}" > "$tmpdir/${i}"
+            fi
+        ) &
+        pids+=($!)
+        # Limit concurrency to avoid fd exhaustion
+        if (( ${#pids[@]} >= 50 )); then
+            wait "${pids[0]}" 2>/dev/null || true
+            pids=("${pids[@]:1}")
+        fi
+    done
+    # Wait for all remaining
+    for pid in "${pids[@]}"; do
+        wait "$pid" 2>/dev/null || true
+    done
+
+    # Collect results
+    local devices=()
+    for f in "$tmpdir"/*; do
+        [[ -f "$f" ]] || continue
+        devices+=("$(cat "$f")")
+    done
+
+    if [[ ${#devices[@]} -eq 0 ]]; then
+        return 1
+    fi
+
+    # Print and return
+    printf '%s\n' "${devices[@]}"
+}
+
+select_device() {
+    local port="$1"
+
+    local devices_raw
+    devices_raw=$(discover_devices "$port") || {
+        log_warn "No LocalSend devices found on the network."
+        echo ""
+        read -rp "Enter the target machine's IP address manually: " manual_ip
+        if [[ -z "$manual_ip" ]]; then
+            log_error "No target IP provided."
+            exit 1
+        fi
+        echo "$manual_ip"
+        return
+    }
+
+    # Parse into arrays
+    local ips=() aliases=()
+    while IFS='|' read -r ip alias; do
+        ips+=("$ip")
+        aliases+=("$alias")
+    done <<< "$devices_raw"
+
+    if [[ ${#ips[@]} -eq 1 ]]; then
+        log_success "Found 1 device: ${aliases[0]} (${ips[0]})"
+        read -rp "Send to this device? [Y/n] " answer
+        if [[ "${answer,,}" == "n" ]]; then
+            read -rp "Enter the target machine's IP address: " manual_ip
+            echo "$manual_ip"
+            return
+        fi
+        echo "${ips[0]}"
+        return
+    fi
+
+    echo ""
+    log_info "Found ${#ips[@]} LocalSend devices:"
+    echo ""
+    for i in "${!ips[@]}"; do
+        printf '  %s[%d]%s  %s (%s)\n' "$BOLD" $((i + 1)) "$RESET" "${aliases[$i]}" "${ips[$i]}"
+    done
+    echo ""
+    read -rp "Select device [1-${#ips[@]}]: " choice
+
+    if [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= ${#ips[@]} )); then
+        echo "${ips[$((choice - 1))]}"
+    else
+        log_error "Invalid selection."
+        exit 1
+    fi
+}
+
 LOCALSEND_BIN=""
 
 find_localsend_cli() {
@@ -535,14 +652,10 @@ do_localsend_send() {
     local file="$3"
 
     if [[ "$LOCALSEND_VARIANT" == "localsend-go" ]]; then
-        # localsend-go has no --target flag; it uses interactive device discovery
-        if [[ -n "$target" ]]; then
-            log_warn "localsend-go does not support --target. It will discover devices on the LAN."
-            log_warn "Look for the target device (IP: $target) in the device list and select it."
-        fi
+        # localsend-go uses interactive device picker — tell user which to select
+        log_info "localsend-go will show discovered devices. Select the one matching: $target"
         if [[ "$port" != "$DEFAULT_PORT" ]]; then
             log_warn "localsend-go hardcodes remote port $DEFAULT_PORT when sending."
-            log_warn "Your --port $port will only affect the local listening port."
         fi
         echo ""
         "$LOCALSEND_BIN" --port="$port" send "$file"
@@ -578,7 +691,10 @@ cmd_listen() {
     log_info "Listening for incoming token on port ${BOLD}${port}${RESET}..."
     echo ""
     echo "  On the authenticated machine, run:"
-    echo "    ${BOLD}cc-auth-bridge provide --target $ip --port $port${RESET}"
+    echo "    ${BOLD}cc-auth-bridge provide${RESET}"
+    echo ""
+    echo "  It will auto-discover this device, or you can specify:"
+    echo "    ${BOLD}cc-auth-bridge provide --target $ip${RESET}"
     echo ""
 
     # Receive file via LocalSend
@@ -741,22 +857,14 @@ cmd_provide() {
     mv "$tmpf" "$json_tmpf"
     TMPFILES+=("$json_tmpf")
 
-    # Get target IP (not needed for localsend-go which uses discovery, but still useful for messaging)
-    if [[ -z "$target" ]] && [[ "$LOCALSEND_VARIANT" != "localsend-go" ]]; then
+    # Discover or prompt for target
+    if [[ -z "$target" ]]; then
         echo ""
-        read -rp "Enter the target machine's IP address: " target
-        if [[ -z "$target" ]]; then
-            log_error "No target IP provided."
-            exit 1
-        fi
+        target=$(select_device "$port")
     fi
 
     echo ""
-    if [[ -n "$target" ]]; then
-        log_info "Sending token to ${BOLD}${target}:${port}${RESET} via LocalSend..."
-    else
-        log_info "Sending token via LocalSend (device discovery)..."
-    fi
+    log_info "Sending token to ${BOLD}${target}:${port}${RESET} via LocalSend..."
 
     if do_localsend_send "$port" "$target" "$json_tmpf"; then
         echo ""
@@ -794,7 +902,7 @@ ${BOLD}QUICK START${RESET}
         cc-auth-bridge listen
 
     On the authenticated machine:
-        cc-auth-bridge provide --target <headless-ip>
+        cc-auth-bridge provide
 EOF
 }
 
@@ -817,7 +925,7 @@ ${BOLD}cc-auth-bridge provide${RESET}
 Send a Claude Code OAuth token via LocalSend.
 
 ${BOLD}FLAGS${RESET}
-    --target IP       Target machine IP (prompted if not given)
+    --target IP       Target machine IP (auto-discovered if not given)
     --port PORT       LocalSend port (default: $DEFAULT_PORT)
     --force-reauth    Re-run 'claude auth login' even if credentials exist
     -h, --help        Show this help

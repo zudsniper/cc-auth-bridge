@@ -40,10 +40,14 @@ This prints the machine's local IP and waits for an incoming token.
 ### On the authenticated machine (sender):
 
 ```bash
-cc-auth-bridge provide --target <headless-machine-ip>
+cc-auth-bridge provide
 ```
 
-This extracts your OAuth token (or runs `claude auth login` if needed) and sends it via LocalSend.
+This extracts your OAuth token (or runs `claude auth login` if needed), scans the LAN for listening devices, and sends the token via LocalSend. If multiple listeners are found, you'll be prompted to pick one. You can also specify a target directly:
+
+```bash
+cc-auth-bridge provide --target 192.168.1.42
+```
 
 ### Options
 
@@ -54,7 +58,7 @@ cc-auth-bridge listen [flags]
     --dry-run       Print what would be done without writing
 
 cc-auth-bridge provide [flags]
-    --target IP       Target machine IP (prompted if not given)
+    --target IP       Target machine IP (auto-discovered if not given)
     --port PORT       LocalSend port (default: 53317)
     --force-reauth    Re-run 'claude auth login' even if credentials exist
 ```

@@ -1,0 +1,627 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# cc-auth-bridge — Beam Claude Code OAuth tokens to headless machines via LocalSend
+# https://github.com/localsend/localsend
+
+readonly VERSION="1.0.0"
+readonly CREDS_DIR="$HOME/.claude"
+readonly CREDS_FILE="$CREDS_DIR/.credentials.json"
+readonly DEFAULT_PORT=53317
+
+# --- Color helpers ---
+
+_setup_colors() {
+    if [[ "${NO_COLOR:-}" != "" ]] || [[ "${TERM:-dumb}" == "dumb" ]] || ! command -v tput &>/dev/null; then
+        RED="" GREEN="" YELLOW="" BLUE="" BOLD="" RESET=""
+    else
+        RED=$(tput setaf 1)    GREEN=$(tput setaf 2)
+        YELLOW=$(tput setaf 3) BLUE=$(tput setaf 4)
+        BOLD=$(tput bold)      RESET=$(tput sgr0)
+    fi
+}
+_setup_colors
+
+log_info()    { printf '%s[info]%s %s\n'    "$BLUE"   "$RESET" "$*"; }
+log_warn()    { printf '%s[warn]%s %s\n'    "$YELLOW" "$RESET" "$*" >&2; }
+log_error()   { printf '%s[error]%s %s\n'   "$RED"    "$RESET" "$*" >&2; }
+log_success() { printf '%s[ok]%s %s\n'      "$GREEN"  "$RESET" "$*"; }
+
+# --- Cleanup trap ---
+
+TMPFILES=()
+cleanup() {
+    for f in "${TMPFILES[@]}"; do
+        rm -f "$f" 2>/dev/null || true
+    done
+}
+trap cleanup EXIT
+
+mktmpfile() {
+    local f
+    f=$(mktemp "${TMPDIR:-/tmp}/cc-auth-bridge.XXXXXX")
+    TMPFILES+=("$f")
+    echo "$f"
+}
+
+# --- Utility functions ---
+
+detect_os() {
+    local uname_out
+    uname_out=$(uname -s)
+    case "$uname_out" in
+        Darwin) echo "darwin" ;;
+        Linux)  echo "linux" ;;
+        *)      log_error "Unsupported OS: $uname_out"; exit 1 ;;
+    esac
+}
+
+get_local_ip() {
+    local os
+    os=$(detect_os)
+    if [[ "$os" == "darwin" ]]; then
+        # Try common interfaces in order
+        for iface in en0 en1 en2; do
+            local ip
+            ip=$(ipconfig getifaddr "$iface" 2>/dev/null || true)
+            if [[ -n "$ip" ]]; then
+                echo "$ip"
+                return
+            fi
+        done
+        log_warn "Could not detect local IP"
+        echo "unknown"
+    else
+        # Linux
+        local ip
+        ip=$(hostname -I 2>/dev/null | awk '{print $1}')
+        if [[ -n "$ip" ]]; then
+            echo "$ip"
+        else
+            log_warn "Could not detect local IP"
+            echo "unknown"
+        fi
+    fi
+}
+
+LOCALSEND_BIN=""
+
+find_localsend_cli() {
+    for candidate in localsend_app localsend-cli localsend; do
+        if command -v "$candidate" &>/dev/null; then
+            LOCALSEND_BIN="$candidate"
+            return 0
+        fi
+    done
+    return 1
+}
+
+check_dependencies() {
+    local missing=0
+    local os
+    os=$(detect_os)
+
+    if ! command -v claude &>/dev/null; then
+        log_error "'claude' CLI not found in PATH"
+        echo "  Install: npm install -g @anthropic-ai/claude-code"
+        missing=1
+    fi
+
+    if ! command -v jq &>/dev/null; then
+        log_error "'jq' not found in PATH"
+        if [[ "$os" == "darwin" ]]; then
+            echo "  Install: brew install jq"
+        else
+            echo "  Install: sudo apt-get install jq"
+        fi
+        missing=1
+    fi
+
+    if ! find_localsend_cli; then
+        log_error "LocalSend CLI not found in PATH"
+        echo "  Looked for: localsend_app, localsend-cli, localsend"
+        if [[ "$os" == "darwin" ]]; then
+            echo "  Install: brew install localsend"
+        else
+            echo "  Install: see https://github.com/localsend/localsend#install"
+        fi
+        echo ""
+        read -rp "Attempt automatic install? [y/N] " answer
+        if [[ "${answer,,}" == "y" ]]; then
+            install_localsend
+        else
+            missing=1
+        fi
+    fi
+
+    if [[ $missing -ne 0 ]]; then
+        log_error "Missing dependencies. Install them and retry."
+        exit 1
+    fi
+}
+
+install_localsend() {
+    local os
+    os=$(detect_os)
+    if [[ "$os" == "darwin" ]]; then
+        log_info "Installing LocalSend via Homebrew..."
+        if ! command -v brew &>/dev/null; then
+            log_error "Homebrew not found. Install LocalSend manually."
+            exit 1
+        fi
+        brew install localsend
+    else
+        log_info "Installing LocalSend on Linux..."
+        if command -v apt-get &>/dev/null; then
+            # Fetch latest .deb from GitHub releases
+            local release_url latest_tag deb_url tmpf
+            release_url="https://api.github.com/repos/localsend/localsend/releases/latest"
+            latest_tag=$(curl -fsSL "$release_url" | jq -r '.tag_name')
+            if [[ -z "$latest_tag" || "$latest_tag" == "null" ]]; then
+                log_error "Could not fetch latest LocalSend release"
+                exit 1
+            fi
+            local ver="${latest_tag#v}"
+            deb_url="https://github.com/localsend/localsend/releases/download/${latest_tag}/LocalSend-${ver}-linux-x86-64.deb"
+            tmpf=$(mktmpfile)
+            log_info "Downloading $deb_url ..."
+            curl -fsSL -o "$tmpf" "$deb_url"
+            sudo dpkg -i "$tmpf" || sudo apt-get install -f -y
+        else
+            log_error "Unsupported Linux package manager. Install LocalSend manually."
+            log_error "See: https://github.com/localsend/localsend#install"
+            exit 1
+        fi
+    fi
+
+    if ! find_localsend_cli; then
+        log_error "LocalSend installed but CLI binary not found in PATH."
+        log_error "You may need to add it to your PATH or restart your shell."
+        exit 1
+    fi
+    log_success "LocalSend CLI found: $LOCALSEND_BIN"
+}
+
+extract_token() {
+    if [[ ! -f "$CREDS_FILE" ]]; then
+        log_error "Credentials file not found: $CREDS_FILE"
+        return 1
+    fi
+
+    local token
+    token=$(jq -r '
+        # Try common key patterns
+        if .claudeAiOauth then .claudeAiOauth.accessToken
+        elif .oauth_token then .oauth_token
+        elif .token then .token
+        else (to_entries | map(select(.value | type == "string" and startswith("sk-ant-oat01-"))) | .[0].value // empty)
+        end
+    ' "$CREDS_FILE" 2>/dev/null || true)
+
+    if [[ -z "$token" ]]; then
+        # Fallback: grep for the token pattern
+        token=$(grep -oE 'sk-ant-oat01-[A-Za-z0-9_-]+' "$CREDS_FILE" 2>/dev/null | head -1 || true)
+    fi
+
+    if [[ -z "$token" ]]; then
+        log_error "Could not extract OAuth token from $CREDS_FILE"
+        log_error "Expected token matching pattern: sk-ant-oat01-*"
+        return 1
+    fi
+
+    if [[ ! "$token" =~ ^sk-ant-oat01- ]]; then
+        log_warn "Token does not match expected pattern (sk-ant-oat01-*). Proceeding anyway."
+    fi
+
+    echo "$token"
+}
+
+backup_credentials() {
+    if [[ -f "$CREDS_FILE" ]]; then
+        local ts backup
+        ts=$(date +%Y%m%d%H%M%S)
+        backup="${CREDS_FILE}.bak.${ts}"
+        cp "$CREDS_FILE" "$backup"
+        log_info "Backed up existing credentials to $backup"
+    fi
+}
+
+write_credentials() {
+    local token="$1"
+    mkdir -p "$CREDS_DIR"
+
+    # If existing creds file has structure, try to preserve it
+    if [[ -f "$CREDS_FILE" ]] && jq -e '.claudeAiOauth' "$CREDS_FILE" &>/dev/null; then
+        # Update the existing structure
+        local tmpf
+        tmpf=$(mktmpfile)
+        jq --arg tok "$token" '.claudeAiOauth.accessToken = $tok' "$CREDS_FILE" > "$tmpf"
+        mv "$tmpf" "$CREDS_FILE"
+    else
+        # Write a simple credentials file
+        cat > "$CREDS_FILE" <<CREDS_EOF
+{
+  "claudeAiOauth": {
+    "accessToken": "$token"
+  }
+}
+CREDS_EOF
+    fi
+
+    chmod 600 "$CREDS_FILE"
+    log_success "Credentials written to $CREDS_FILE (mode 0600)"
+}
+
+inject_env_var() {
+    local token="$1"
+    local start_marker="# --- cc-auth-bridge START ---"
+    local end_marker="# --- cc-auth-bridge END ---"
+    local export_line="export CLAUDE_OAUTH_TOKEN=\"$token\""
+    local block
+    block=$(printf '%s\n%s\n%s' "$start_marker" "$export_line" "$end_marker")
+
+    local rc_files=()
+    if [[ -f "$HOME/.bashrc" ]]; then rc_files+=("$HOME/.bashrc"); fi
+    if [[ -f "$HOME/.zshrc" ]]; then rc_files+=("$HOME/.zshrc"); fi
+
+    # If no rc files exist, create .bashrc
+    if [[ ${#rc_files[@]} -eq 0 ]]; then
+        rc_files=("$HOME/.bashrc")
+        touch "$HOME/.bashrc"
+    fi
+
+    for rcfile in "${rc_files[@]}"; do
+        if grep -qF "$start_marker" "$rcfile" 2>/dev/null; then
+            # Replace existing block
+            local tmpf
+            tmpf=$(mktmpfile)
+            awk -v start="$start_marker" -v end="$end_marker" -v block="$block" '
+                $0 == start { skip=1; print block; next }
+                $0 == end   { skip=0; next }
+                !skip       { print }
+            ' "$rcfile" > "$tmpf"
+            mv "$tmpf" "$rcfile"
+            log_info "Updated token block in $rcfile"
+        else
+            # Append
+            printf '\n%s\n' "$block" >> "$rcfile"
+            log_info "Appended token block to $rcfile"
+        fi
+    done
+}
+
+verify_auth() {
+    log_info "Verifying authentication with Claude..."
+    local output
+    if output=$(claude -p "say hi" --output-format json 2>&1); then
+        if echo "$output" | jq -e '.error' &>/dev/null 2>&1; then
+            local err
+            err=$(echo "$output" | jq -r '.error' 2>/dev/null || echo "$output")
+            log_error "Auth verification failed: $err"
+            return 1
+        fi
+        log_success "Authentication verified — Claude is working!"
+        return 0
+    else
+        log_error "Auth verification failed. 'claude' command returned non-zero."
+        log_error "Output: $output"
+        return 1
+    fi
+}
+
+warn_api_key() {
+    if [[ -n "${ANTHROPIC_API_KEY:-}" ]]; then
+        echo ""
+        printf '%s%s========================================%s\n' "$BOLD" "$YELLOW" "$RESET"
+        printf '%s%s  WARNING: ANTHROPIC_API_KEY is set!%s\n'    "$BOLD" "$YELLOW" "$RESET"
+        printf '%s%s========================================%s\n' "$BOLD" "$YELLOW" "$RESET"
+        echo ""
+        log_warn "Claude Code may use the API key instead of the OAuth token."
+        log_warn "If you want to use the subscription (OAuth) auth, unset it:"
+        echo "    unset ANTHROPIC_API_KEY"
+        echo ""
+    fi
+}
+
+# --- Subcommands ---
+
+cmd_listen() {
+    local port="$DEFAULT_PORT"
+    local no_verify=false
+    local dry_run=false
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --port)     port="$2"; shift 2 ;;
+            --no-verify) no_verify=true; shift ;;
+            --dry-run)  dry_run=true; shift ;;
+            -h|--help)  usage_listen; exit 0 ;;
+            *)          log_error "Unknown flag: $1"; usage_listen; exit 1 ;;
+        esac
+    done
+
+    check_dependencies
+    warn_api_key
+
+    local ip
+    ip=$(get_local_ip)
+    echo ""
+    log_info "This machine's local IP: ${BOLD}${ip}${RESET}"
+    log_info "Listening for incoming token on port ${BOLD}${port}${RESET}..."
+    echo ""
+    echo "  On the authenticated machine, run:"
+    echo "    ${BOLD}cc-auth-bridge provide --target $ip --port $port${RESET}"
+    echo ""
+
+    # Receive file via LocalSend
+    local recv_dir
+    recv_dir=$(mktemp -d "${TMPDIR:-/tmp}/cc-auth-recv.XXXXXX")
+    TMPFILES+=("$recv_dir")
+
+    log_info "Waiting for token transfer via LocalSend..."
+    if ! "$LOCALSEND_BIN" receive --port "$port" --destination "$recv_dir" 2>&1; then
+        log_error "LocalSend receive failed"
+        exit 1
+    fi
+
+    # Find the received JSON file
+    local json_file=""
+    for f in "$recv_dir"/*.json; do
+        if [[ -f "$f" ]]; then
+            json_file="$f"
+            break
+        fi
+    done
+
+    if [[ -z "$json_file" ]]; then
+        log_error "No JSON file received. Expected a .json file from LocalSend."
+        log_error "Files in receive directory:"
+        ls -la "$recv_dir" >&2
+        exit 1
+    fi
+
+    log_info "Received file: $json_file"
+
+    # Parse and validate
+    local token
+    token=$(jq -r '.claude_code_oauth_token // empty' "$json_file" 2>/dev/null || true)
+
+    if [[ -z "$token" ]]; then
+        log_error "Received file does not contain 'claude_code_oauth_token' field."
+        log_error "File contents:"
+        cat "$json_file" >&2
+        exit 1
+    fi
+
+    if [[ ! "$token" =~ ^sk-ant-oat01- ]]; then
+        log_warn "Token does not match expected format (sk-ant-oat01-*)"
+    fi
+
+    local source_host generated_at
+    source_host=$(jq -r '.source_host // "unknown"' "$json_file" 2>/dev/null)
+    generated_at=$(jq -r '.generated_at // "unknown"' "$json_file" 2>/dev/null)
+    log_info "Token from host: $source_host (generated: $generated_at)"
+
+    if [[ "$dry_run" == true ]]; then
+        echo ""
+        log_info "[DRY RUN] Would write credentials to $CREDS_FILE"
+        log_info "[DRY RUN] Would inject env var into shell rc files"
+        log_info "[DRY RUN] Token: ${token:0:20}..."
+        exit 0
+    fi
+
+    # Write credentials
+    backup_credentials
+    write_credentials "$token"
+    inject_env_var "$token"
+
+    # Verify
+    if [[ "$no_verify" == false ]]; then
+        echo ""
+        if verify_auth; then
+            echo ""
+            log_success "All done! Claude Code is authenticated on this machine."
+        else
+            echo ""
+            log_warn "Verification failed. The token was written, but Claude may not be working."
+            log_warn "Try running: claude auth login"
+            exit 1
+        fi
+    else
+        echo ""
+        log_success "Token written. Skipping verification (--no-verify)."
+    fi
+
+    # Clean up received file
+    rm -f "$json_file" 2>/dev/null || true
+}
+
+cmd_provide() {
+    local target=""
+    local port="$DEFAULT_PORT"
+    local force_reauth=false
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --target)        target="$2"; shift 2 ;;
+            --port)          port="$2"; shift 2 ;;
+            --force-reauth)  force_reauth=true; shift ;;
+            -h|--help)       usage_provide; exit 0 ;;
+            *)               log_error "Unknown flag: $1"; usage_provide; exit 1 ;;
+        esac
+    done
+
+    check_dependencies
+
+    local ip
+    ip=$(get_local_ip)
+    echo ""
+    log_info "This machine's local IP: ${BOLD}${ip}${RESET}"
+
+    # Get or refresh token
+    local token=""
+
+    if [[ "$force_reauth" == true ]]; then
+        log_info "Force re-auth requested. Running claude auth login..."
+        echo ""
+        echo "  A browser window will open for authentication."
+        echo "  Complete the login, then return here."
+        echo ""
+        claude auth login
+        token=$(extract_token)
+    elif [[ -f "$CREDS_FILE" ]]; then
+        log_info "Found existing credentials at $CREDS_FILE"
+        token=$(extract_token) || true
+        if [[ -z "$token" ]]; then
+            log_warn "Could not extract token from existing credentials."
+            log_info "Running claude auth login..."
+            claude auth login
+            token=$(extract_token)
+        fi
+    else
+        log_info "No credentials found. Running claude auth login..."
+        echo ""
+        echo "  A browser window will open for authentication."
+        echo "  Complete the login, then return here."
+        echo ""
+        claude auth login
+        token=$(extract_token)
+    fi
+
+    if [[ -z "$token" ]]; then
+        log_error "Failed to obtain a token. Aborting."
+        exit 1
+    fi
+
+    log_success "Token extracted: ${token:0:20}..."
+
+    # Package as JSON
+    local payload tmpf
+    tmpf=$(mktmpfile)
+    payload=$(jq -n \
+        --arg token "$token" \
+        --arg generated_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+        --arg source_host "$(hostname)" \
+        '{
+            claude_code_oauth_token: $token,
+            generated_at: $generated_at,
+            source_host: $source_host
+        }')
+    echo "$payload" > "$tmpf"
+    # Rename to .json for LocalSend
+    local json_tmpf="${tmpf}.json"
+    mv "$tmpf" "$json_tmpf"
+    TMPFILES+=("$json_tmpf")
+
+    # Get target IP
+    if [[ -z "$target" ]]; then
+        echo ""
+        read -rp "Enter the target machine's IP address: " target
+        if [[ -z "$target" ]]; then
+            log_error "No target IP provided."
+            exit 1
+        fi
+    fi
+
+    echo ""
+    log_info "Sending token to ${BOLD}${target}:${port}${RESET} via LocalSend..."
+
+    if "$LOCALSEND_BIN" send --port "$port" --destination "$target" --file "$json_tmpf" 2>&1; then
+        echo ""
+        log_success "Token sent successfully!"
+        log_info "On the target machine, the token should now be received and applied."
+    else
+        log_error "LocalSend send failed."
+        log_error "Make sure the target machine is running: cc-auth-bridge listen --port $port"
+        exit 1
+    fi
+}
+
+# --- Usage / Help ---
+
+usage() {
+    cat <<EOF
+${BOLD}cc-auth-bridge${RESET} v${VERSION}
+Beam Claude Code OAuth tokens to headless machines via LocalSend.
+
+${BOLD}USAGE${RESET}
+    cc-auth-bridge [options] [subcommand]
+
+${BOLD}SUBCOMMANDS${RESET}
+    listen      (default) Receive a token via LocalSend
+    provide     Send a token via LocalSend
+
+${BOLD}OPTIONS${RESET}
+    -h, --help      Show this help message
+    -v, --version   Print version
+
+Run '${BOLD}cc-auth-bridge <subcommand> --help${RESET}' for subcommand-specific options.
+
+${BOLD}QUICK START${RESET}
+    On the headless machine:
+        cc-auth-bridge listen
+
+    On the authenticated machine:
+        cc-auth-bridge provide --target <headless-ip>
+EOF
+}
+
+usage_listen() {
+    cat <<EOF
+${BOLD}cc-auth-bridge listen${RESET}
+Receive a Claude Code OAuth token via LocalSend.
+
+${BOLD}FLAGS${RESET}
+    --port PORT     LocalSend port (default: $DEFAULT_PORT)
+    --no-verify     Skip post-transfer auth verification
+    --dry-run       Print what would be done without writing anything
+    -h, --help      Show this help
+EOF
+}
+
+usage_provide() {
+    cat <<EOF
+${BOLD}cc-auth-bridge provide${RESET}
+Send a Claude Code OAuth token via LocalSend.
+
+${BOLD}FLAGS${RESET}
+    --target IP       Target machine IP (prompted if not given)
+    --port PORT       LocalSend port (default: $DEFAULT_PORT)
+    --force-reauth    Re-run 'claude auth login' even if credentials exist
+    -h, --help        Show this help
+EOF
+}
+
+# --- Main ---
+
+main() {
+    local cmd=""
+
+    # Parse top-level args
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            listen|provide)
+                cmd="$1"; shift; break ;;
+            -h|--help)
+                usage; exit 0 ;;
+            -v|--version)
+                echo "cc-auth-bridge v${VERSION}"; exit 0 ;;
+            -*)
+                log_error "Unknown option: $1"; usage; exit 1 ;;
+            *)
+                log_error "Unknown command: $1"; usage; exit 1 ;;
+        esac
+    done
+
+    # Default to listen
+    if [[ -z "$cmd" ]]; then
+        cmd="listen"
+    fi
+
+    case "$cmd" in
+        listen)  cmd_listen "$@" ;;
+        provide) cmd_provide "$@" ;;
+    esac
+}
+
+main "$@"
